@@ -48,6 +48,7 @@ class TinyG2Parser {
         const parsers = [
             TinyG2ParserResultQueueReports,
             TinyG2ParserResultStatusReports,
+            TinyG2ParserResultReceiveReport,
             TinyG2ParserResultFirmwareBuild,
             TinyG2ParserResultHardwarePlatform
         ];
@@ -107,6 +108,24 @@ class TinyG2ParserResultStatusReports {
 
         return {
             type: TinyG2ParserResultStatusReports,
+            payload: payload
+        };
+    }
+}
+
+class TinyG2ParserResultReceiveReport {
+    static parse(data) {
+        const r = _.get(data, 'r.r') || _.get(data, 'r');
+        if (!r) {
+            return null;
+        }
+
+        const payload = {
+            r: r
+        };
+
+        return {
+            type: TinyG2ParserResultReceiveReport,
             payload: payload
         };
     }
@@ -336,14 +355,14 @@ class TinyG2 extends events.EventEmitter {
                     };
                 }
                 this.emit('sr', payload.sr);
-            } else if (type === TinyG2ParserResultFirmwareBuild) {
-                if (!_.isEqual(this.state.fb, payload.fb)) {
+            } else if (type === TinyG2ParserResultReceiveReport) {
+                if (!_.isEqual(this.state.r, payload.r)) {
                     this.state = { // enforce state change
                         ...this.state,
-                        fb: payload.fb
+                        r: payload.r
                     };
                 }
-                this.emit('fb', payload.fb);
+                this.emit('r', payload.r);
             } else if (type === TinyG2ParserResultHardwarePlatform) {
                 if (!_.isEqual(this.state.hp, payload.hp)) {
                     this.state = { // enforce state change

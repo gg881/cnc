@@ -14,11 +14,15 @@ import {
 } from '../../constants';
 import {
     TINYG2,
-    TINYG2_PLANNER_BUFFER_POOL_SIZE,
     TINYG2_PLANNER_BUFFER_LOW_WATER_MARK,
     TINYG2_PLANNER_QUEUE_STATUS_READY,
-    TINYG2_PLANNER_QUEUE_STATUS_RUNNING,
-    TINYG2_PLANNER_QUEUE_STATUS_BLOCKED
+    TINYG2_PLANNER_QUEUE_STATUS_BLOCKED,
+    TINYG2_COMMAND_ACK,
+    SENDER_MODE_RUN,
+    SENDER_MODE_NOQR,
+    SENDER_MODE_WAIT,
+    QR_STATE_UNKNOWN,
+    QR_STATE_OK
 } from './constants';
 
 const noop = () => {};
@@ -103,6 +107,7 @@ class TinyG2Controller {
 
         // Sender
         this.sender = new Sender(STREAMING_PROTOCOL_SEND_RESPONSE);
+
         this.sender.on('gcode', (gcode = '') => {
             if (this.isClose()) {
                 log.error(`[TinyG2] The serial port "${this.options.port}" is not accessible`);
@@ -116,9 +121,46 @@ class TinyG2Controller {
 
             gcode = ('' + gcode).trim();
             if (gcode.length > 0) {
-                const cmd = JSON.stringify({ gc: gcode });
+                if (this.lineNum === 0) {
+                    this.plannerQueueStatus = TINYG2_PLANNER_QUEUE_STATUS_READY;
+                }
+
+//              default condition - fallback no QR mode
+                this.qrState = QR_STATE_UNKNOWN;
+                this.senderMode = SENDER_MODE_NOQR;
+
+//              assume standard linear move - these commands generate only one item in planner queue / standard sender mode
+                if (gcode.includes('X') || gcode.includes('Y') || gcode.includes('Z')) {
+                    this.senderMode = SENDER_MODE_RUN;
+                }
+
+//              arc commands  - these commands generate multiple items in planner queue / wait sate sender mode
+                if (gcode.includes('I') || gcode.includes('J') || gcode.includes('K')) {
+                    this.senderMode = SENDER_MODE_WAIT;
+                }
+
+//              control commands - these commands generate QR update / NOQR sate sender mode
+                if (gcode.includes('G4') || gcode.includes('G5') || gcode.includes('G6') || gcode.includes('G9')) {
+                    this.senderMode = SENDER_MODE_NOQR;
+                }
+
+//   https://github.com/synthetos/g2/wiki/g2core-Communications
+//   Add line number Format Nxx
+                this.lineNum += 1;
+//   due to bug in 100.17 sending gcode in raw format
+//                gcode = ('N' + this.lineNum + ' ' + gcode).trim();
+//                const cmd = JSON.stringify({ gc: gcode });
+                const cmd = ('N' + this.lineNum + ' ' + gcode).trim();
                 this.serialport.write(cmd + '\n');
-                dbg(`[TinyG2] > ${cmd}`);
+                dbg(`[TinyG2] > Mode ${this.senderMode} Send ${cmd}`);
+
+//   request qr report for non motion commands
+                if (this.senderMode === SENDER_MODE_NOQR) {
+                    const cmd = JSON.stringify({ qr: null });
+                    this.serialport.write(cmd + '\n');
+                    this.senderMode = SENDER_MODE_RUN;
+                    dbg(`[TinyG2] > Mode ${this.senderMode} Send ${cmd}`);
+                }
             }
         });
 
@@ -132,37 +174,92 @@ class TinyG2Controller {
         });
 
         this.tinyG2.on('qr', ({ qr, qi, qo }) => {
-            const prevPlannerQueueStatus = this.plannerQueueStatus;
-
+            this.stateqrOld = this.state.qr;
             this.state.qr = qr;
             this.state.qi = qi;
             this.state.qo = qo;
+            this.qrState = QR_STATE_OK;
+            this.plannerQueueStatus = TINYG2_PLANNER_QUEUE_STATUS_BLOCKED;
 
-            if (qr <= TINYG2_PLANNER_BUFFER_LOW_WATER_MARK) {
-                this.plannerQueueStatus = TINYG2_PLANNER_QUEUE_STATUS_BLOCKED;
+//  G2, G3 - wait until controller stops filling planner queue -> qi === 0 or qo > qi
+            if ((this.senderMode === SENDER_MODE_WAIT) && ((qi === 0) || (qo > qi))) {
+                dbg(`[TinyG2] > QR State Wait ${qr} ${qi} ${qo}`);
+                this.senderMode = SENDER_MODE_RUN;
+            }
+//  planner queue low water mark
+            if ((qr > TINYG2_PLANNER_BUFFER_LOW_WATER_MARK)) {
+                this.plannerQueueStatus = TINYG2_PLANNER_QUEUE_STATUS_READY;
+// Sender
+                if (this.tinygBufferState === TINYG2_COMMAND_ACK) {
+                    if ((this.workflowState === WORKFLOW_STATE_RUNNING) && (this.senderMode === SENDER_MODE_RUN)) {
+                        this.sender.ack();
+                        this.sender.next();
+                        dbg(`[TinyG2] > QR Next Command ${qr}`);
+                        return;
+                    } else {
+// Feeder
+                        this.feeder.next();
+                        this.plannerQueueStatus = TINYG2_PLANNER_QUEUE_STATUS_READY;
+                        return;
+                    }
+                }
+            }
+        });
+
+        this.tinyG2.on('r', (r) => {
+        //  https://github.com/synthetos/g2/wiki/g2core-Communications
+            const line = _.get(r, 'r.n') || _.get(r, 'n');
+
+            dbg(`[TinyG2] > ACK Line ${line} ${this.lineNum} Mode ${this.senderMode} ${this.plannerQueueStatus}`);
+            // Feeder
+            if (this.workflowState !== WORKFLOW_STATE_RUNNING) {
+                this.feeder.next();
+                return;
+            }
+            if (this.senderMode === SENDER_MODE_WAIT) {
                 return;
             }
 
-            if (qr >= TINYG2_PLANNER_BUFFER_POOL_SIZE) {
-                this.plannerQueueStatus = TINYG2_PLANNER_QUEUE_STATUS_READY;
-            } else {
-                this.plannerQueueStatus = TINYG2_PLANNER_QUEUE_STATUS_RUNNING;
-            }
+// command received
+            this.tinygBufferState = TINYG2_COMMAND_ACK;
 
-            if (prevPlannerQueueStatus === TINYG2_PLANNER_QUEUE_STATUS_BLOCKED) {
-                // Sender
-                if (this.workflowState === WORKFLOW_STATE_RUNNING) {
-                    this.sender.ack();
-                    this.sender.next();
-                    return;
-                }
-
-                // Feeder
-                this.feeder.next();
+// send next command if queues ready - otherwise delegate to qr loop
+            if (((this.plannerQueueStatus === TINYG2_PLANNER_QUEUE_STATUS_READY)) && (this.qrState === QR_STATE_OK)) {
+                dbg(`[TinyG2] > R Next Command gcode ${this.senderMode} ${line}`);
+                this.sender.ack();
+                this.sender.next();
+                this.qrState = QR_STATE_UNKNOWN;
+                return;
             }
         });
 
         this.tinyG2.on('sr', (sr) => {
+            //  https://github.com/synthetos/g2/wiki/g2core-Communications
+            //  start execution of command number "line"
+            const line = _.get(sr, 'r.line') || _.get(sr, 'line');
+            const momo = _.get(sr, 'r.momo') || _.get(sr, 'momo');
+
+            //  should be compared with sent line number this.lineNum
+            if (line <= this.lineNum) {
+                dbg(`[TinyG2] > SR Line ${line} ${this.lineNum} Momo ${momo} SMode ${this.senderMode} ${this.plannerQueueStatus} QR ${this.state.qr}`);
+
+           //  G2, G3
+                if ((this.senderMode === SENDER_MODE_WAIT)) {
+                    this.senderMode = SENDER_MODE_RUN;
+                }
+
+           // Sender
+                if (this.workflowState === WORKFLOW_STATE_RUNNING) {
+                    if ((this.plannerQueueStatus === TINYG2_PLANNER_QUEUE_STATUS_READY) && (this.qrState === QR_STATE_OK)) {
+            // Sender
+                        dbg(`[TinyG2] > SR next command ${line}`);
+                        this.sender.ack();
+                        this.sender.next();
+                        this.qrState = QR_STATE_UNKNOWN;
+                        return;
+                    }
+                }
+            }
         });
 
         this.tinyG2.on('fb', (fb) => {
@@ -178,18 +275,12 @@ class TinyG2Controller {
 
             if ((this.workflowState !== WORKFLOW_STATE_IDLE) && (statusCode !== 0)) {
                 const line = this.sender.sent[this.sender.received];
+                dbg(`[TinyG2] > Error error=${statusCode}, line=${this.sender.received + 1}`);
                 this.emitAll('serialport:read', `> ${line}`);
                 this.emitAll('serialport:read', `error=${statusCode}, line=${this.sender.received + 1}`);
             }
 
             if (prevPlannerQueueStatus !== TINYG2_PLANNER_QUEUE_STATUS_BLOCKED) {
-                // Sender
-                if (this.workflowState === WORKFLOW_STATE_RUNNING) {
-                    this.sender.ack();
-                    this.sender.next();
-                    return;
-                }
-
                 // Feeder
                 this.feeder.next();
             }
@@ -260,13 +351,13 @@ class TinyG2Controller {
             // 0=silent, 1=footer, 2=messages, 3=configs, 4=linenum, 5=verbose
             { cmd: '{"jv":4}', pauseAfter: 50 },
 
-            // JSON syntax
-            // 0=relaxed, 1=strict
-            { cmd: '{"js":1}', pauseAfter: 50 },
-
-            // Enable CR on TX
-            // 0=send LF line termination on TX, 1=send both LF and CR termination
-            { cmd: '{"ec":0}', pauseAfter: 50 },
+//            // JSON syntax
+//            // 0=relaxed, 1=strict
+//            { cmd: '{"js":1}', pauseAfter: 50 },
+//
+//            // Enable CR on TX
+//            // 0=send LF line termination on TX, 1=send both LF and CR termination
+//            { cmd: '{"ec":0}', pauseAfter: 50 },
 
             // Queue report verbosity
             // 0=off, 1=filtered, 2=verbose
@@ -278,7 +369,7 @@ class TinyG2Controller {
 
             // Status report interval
             // in milliseconds (50ms minimum interval)
-            { cmd: '{"si":250}', pauseAfter: 50 },
+            { cmd: '{"si":150}', pauseAfter: 50 },
 
             // Setting Status Report Fields
             // https://github.com/synthetos/TinyG/wiki/TinyG-Status-Reports#setting-status-report-fields
@@ -509,6 +600,7 @@ class TinyG2Controller {
             'start': () => {
                 // Feeder
                 this.feeder.clear(); // make sure feeder queue is empty
+                this.lineNum = 0;
 
                 // Sender
                 this.workflowState = WORKFLOW_STATE_RUNNING;
